@@ -1,0 +1,113 @@
+{
+  "id": "gflow",
+  "min_core_version": null,
+  "name": "Google Flow (gflow-cli)",
+  "version": "0.1.0",
+  "plugin_api_version": "1",
+  "entry": {
+    "exe": "videoflow-gflow.exe",
+    "args": [
+      "--port",
+      "{port}",
+      "--data-dir",
+      "{data_dir}",
+      "--config-file",
+      "{config_file}"
+    ]
+  },
+  "data_dir_name": "gflow",
+  "preferred_port": 18611,
+  "health_path": "/healthz",
+  "capabilities_path": "/vf-plugin/v1/capabilities",
+  "quota_path": "/vf-plugin/v1/quota",
+  "upstream": {
+    "name": "gflow-cli",
+    "min_version": "0.107.0"
+  },
+  "permissions": [
+    "network:loopback",
+    "browser:chrome",
+    "fs:own-data-dir"
+  ],
+  "config_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": [
+      "video_model"
+    ],
+    "properties": {
+      "video_model": {
+        "type": "string",
+        "title": "Model video",
+        "default": "veo-fast",
+        "x-dynamic-enum": "capabilities.video.models[].id",
+        "description": "Giá trị phải nằm trong capabilities.video.models[].id; plugin tự validate lại lúc submit."
+      },
+      "image_model": {
+        "type": "string",
+        "title": "Model ảnh",
+        "default": "nano2",
+        "x-dynamic-enum": "capabilities.image.models[].id"
+      },
+      "profile": {
+        "type": "string",
+        "title": "Profile Flow",
+        "default": "",
+        "description": "Để trống = plugin tự resolve như gflow (env GFLOW_CLI_PROFILE → config.toml default_profile → profile duy nhất). Tên trơn, không chứa dấu phân cách đường dẫn."
+      },
+      "project_id": {
+        "type": "string",
+        "title": "Flow project id",
+        "default": "",
+        "description": "Để trống = plugin tạo 1 project chung rồi lưu ID vào jobs.db của instance."
+      },
+      "max_credits_per_clip": {
+        "type": "integer",
+        "title": "Cap credits / clip",
+        "default": 10,
+        "minimum": 0,
+        "maximum": 100
+      },
+      "bridge_port": {
+        "type": "integer",
+        "title": "Port plugin",
+        "default": 18611,
+        "minimum": 1,
+        "maximum": 65535,
+        "description": "Port ưa thích của instance này; bận thì host tự xin port khác."
+      },
+      "proxy": {
+        "type": "string",
+        "title": "Proxy của profile",
+        "default": "",
+        "x-secret": true,
+        "description": "Để trống = không dùng proxy. Chỉ dùng proxy riêng của profile, không dùng proxy share nhiều người."
+      },
+      "daemon_token": {
+        "type": "string",
+        "title": "Daemon token",
+        "default": "",
+        "x-secret": true,
+        "description": "Chỉ dùng khi transport HTTP (gflow serve). Lưu vào Credential Manager, không lưu vào plugins.json."
+      }
+    }
+  },
+  "actions": [
+    {
+      "id": "login",
+      "scope": "instance",
+      "label": "Đăng nhập Flow",
+      "confirm": "Mở Chrome để đăng nhập Google Flow?"
+    },
+    {
+      "id": "open_project",
+      "scope": "instance",
+      "label": "Mở Flow trên web"
+    },
+    {
+      "id": "recover_media",
+      "scope": "job",
+      "label": "Khôi phục media"
+    }
+  ]
+}

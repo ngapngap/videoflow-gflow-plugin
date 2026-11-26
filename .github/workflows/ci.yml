@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test-and-package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Setup Python 3.12 and sync dependencies
+        run: |
+          uv python install 3.12
+          uv sync --frozen --group dev
+
+      - name: Run Contract v1.2 & unit/integration tests
+        run: uv run pytest -v
+
+      - name: Validate manifest (dev) & test release gate
+        run: |
+          uv run python build_tools/validate_manifest.py manifest.json
+
+      - name: Build PyInstaller onedir dev package
+        run: uv run python build_tools/build_release.py --dev
