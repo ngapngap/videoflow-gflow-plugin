@@ -218,6 +218,7 @@ def test_media_retention_7d_30d_budget_and_410_gone(harness_factory):
     # Use a budget of 80 bytes: 1 file (64 bytes) fits, 2 files (128 bytes) triggers LRU eviction of oldest
     h = harness_factory(clock=clock, media_budget_bytes=80)
     store = h.runtime.store
+    assert h.runtime.media_cleanup_interval_s == 86400  # default cadence: rescan daily
 
     def _create_completed(idx: int, extra_bytes: int = 0) -> tuple[str, str]:
         op_id = str(uuid.uuid4())

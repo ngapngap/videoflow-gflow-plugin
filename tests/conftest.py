@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mcp_client import GflowMcpClient
-from plugin import PluginRuntime, build_runtime, create_app
+from plugin import DEFAULT_MEDIA_CLEANUP_INTERVAL_S, PluginRuntime, build_runtime, create_app
 
 VALID_PNG_1X1_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg=="
@@ -64,6 +64,7 @@ class PluginHarness:
         abandoned_timeout_s: int | None = None,
         poll_interval_s: float = 0.05,
         image_sync_wait_s: float = 1.5,
+        media_cleanup_interval_s: float = DEFAULT_MEDIA_CLEANUP_INTERVAL_S,
     ) -> None:
         self.root = tmp_path
         self.root.mkdir(parents=True, exist_ok=True)
@@ -88,6 +89,7 @@ class PluginHarness:
         self.abandoned_timeout_s = abandoned_timeout_s
         self.poll_interval_s = poll_interval_s
         self.image_sync_wait_s = image_sync_wait_s
+        self.media_cleanup_interval_s = media_cleanup_interval_s
         self._client_cm: TestClient | None = None
         self.client: TestClient | None = None
         self.runtime: PluginRuntime | None = None
@@ -111,6 +113,7 @@ class PluginHarness:
             abandoned_timeout_s=self.abandoned_timeout_s,
             poll_interval_s=self.poll_interval_s,
             image_sync_wait_s=self.image_sync_wait_s,
+            media_cleanup_interval_s=self.media_cleanup_interval_s,
         )
         app = create_app(self.runtime)
         self._client_cm = TestClient(app)

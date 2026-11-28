@@ -49,6 +49,8 @@ from storage import (
 
 logger = logging.getLogger("videoflow_gflow")
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+DEFAULT_MEDIA_CLEANUP_INTERVAL_S = 86400  # SPEC: media is scanned at startup and daily
+_STORAGE_PRESSURE_MESSAGE = "Dung lượng lưu trữ media vượt ngưỡng và không còn file đủ điều kiện dọn."
 
 
 @dataclass(slots=True)
@@ -88,6 +90,7 @@ class PluginRuntime:
     background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     poll_interval_s: float = 0.25
     image_sync_wait_s: float = 2.0
+    media_cleanup_interval_s: float = DEFAULT_MEDIA_CLEANUP_INTERVAL_S
     startup_complete: bool = False
     prompts_seen: set[str] = field(default_factory=set)
 
@@ -614,14 +617,33 @@ async def _run_image_operation(rt: PluginRuntime, operation_id: str, temp_image_
         )
 
 
+def _scan_media_storage(rt: PluginRuntime) -> None:
+    """Run one media retention pass and publish the resulting storage pressure."""
+    cleanup_res = rt.store.run_media_cleanup()
+    rt.storage_pressure = bool(cleanup_res.get("storage_pressure"))
+
+
+async def _media_cleanup_loop(rt: PluginRuntime) -> None:
+    """Re-scan media storage while the plugin runs (SPEC: at startup and daily)."""
+    while True:
+        await asyncio.sleep(rt.media_cleanup_interval_s)
+        try:
+            _scan_media_storage(rt)
+        except Exception as exc:
+            # Keep the last known storage pressure; the next interval retries.
+            logger.warning(
+                "Media cleanup scan failed; retrying at the next interval: %s",
+                sanitize_message(str(exc), secrets=rt.secrets, prompts=rt.prompts_seen),
+            )
+
+
 def create_app(runtime: PluginRuntime) -> FastAPI:
     """Create configured FastAPI application bound to a PluginRuntime."""
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         rt = runtime
-        cleanup_res = rt.store.run_media_cleanup()
-        rt.storage_pressure = bool(cleanup_res.get("storage_pressure"))
+        _scan_media_storage(rt)
         resumed = rt.store.recover_on_startup()
         await _refresh_catalog(rt)
         # recover_on_startup() only returns jobs that already hold an upstream_task_id; reserved
@@ -629,6 +651,7 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
         for op in resumed:
             if op.get("media_kind") == "video" and op.get("upstream_task_id"):
                 rt.track_task(_poll_video_task(rt, op["operation_id"], op["upstream_task_id"]))
+        rt.track_task(_media_cleanup_loop(rt))
         rt.startup_complete = True
         try:
             yield
@@ -708,7 +731,7 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
                     code="STORAGE_BUDGET_EXCEEDED",
                     kind="transient",
                     retryable=False,
-                    message="Dung lượng lưu trữ media vượt ngưỡng và không còn file đủ điều kiện dọn.",
+                    message=_STORAGE_PRESSURE_MESSAGE,
                     scope="instance",
                 ),
             )
@@ -762,6 +785,8 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
             checks["identity"] = {"status": "degraded", "message": rt.identity_message}
         if rt.compatibility_error:
             checks["upstream"] = {"status": "degraded", "message": rt.compatibility_error}
+        if rt.storage_pressure:
+            checks["storage"] = {"status": "degraded", "message": _STORAGE_PRESSURE_MESSAGE}
         if rt.auth_degraded:
             checks["account"] = {"status": "degraded", "message": rt.auth_message or "Cần đăng nhập lại"}
         elif auth_probe_failed:
@@ -1309,6 +1334,7 @@ def build_runtime(
     abandoned_timeout_s: int | None = None,
     poll_interval_s: float = 0.25,
     image_sync_wait_s: float = 2.0,
+    media_cleanup_interval_s: float = DEFAULT_MEDIA_CLEANUP_INTERVAL_S,
 ) -> PluginRuntime:
     """Construct a PluginRuntime from data_dir, config_file, and environment secrets."""
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -1378,6 +1404,7 @@ def build_runtime(
         identity_message=identity_message,
         poll_interval_s=poll_interval_s,
         image_sync_wait_s=image_sync_wait_s,
+        media_cleanup_interval_s=media_cleanup_interval_s,
     )
 
 
