@@ -257,12 +257,21 @@ def test_stale_lock_idle_vs_active_and_scope_isolation(harness_factory):
     )
     assert r_vid2.status_code == 429
 
-    # Image still succeeds!
+    # Image still succeeds! (200 if done within image_sync_wait_s, else 202 + poll operation)
+    img_uuid = str(uuid.uuid4())
     r_img = h_q.client.post(
         "/v1/images/edits",
-        headers=h_q.auth_headers(str(uuid.uuid4())),
+        headers=h_q.auth_headers(img_uuid),
         data={"prompt": "sunset", "model": "nano2", "aspect_ratio": "1:1"},
         files={"image": ("in.png", b"PNGDATA", "image/png")},
     )
+    assert r_img.status_code in (200, 202)
+    if r_img.status_code == 202:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            r_img = h_q.client.get(f"/vf-plugin/v1/operations/{img_uuid}", headers=h_q.auth_headers())
+            if r_img.json()["status"] == "succeeded":
+                break
+            time.sleep(0.05)
     assert r_img.status_code == 200
     assert "b64_json" in r_img.json()["data"][0]

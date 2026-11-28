@@ -45,8 +45,8 @@ def test_image_edits_validation_and_b2_concurrent_replay(harness_factory):
     assert r1.status_code in (200, 202)
     assert r2.status_code in (200, 202)
 
-    # Poll operation UUID until succeeded
-    deadline = time.monotonic() + 3.0
+    # Poll operation UUID until succeeded (20s: each MCP call spawns a mock process)
+    deadline = time.monotonic() + 20.0
     op_body = {}
     while time.monotonic() < deadline:
         op_body = c.get(f"/vf-plugin/v1/operations/{op_uuid}", headers=h.auth_headers()).json()
@@ -54,7 +54,10 @@ def test_image_edits_validation_and_b2_concurrent_replay(harness_factory):
             break
         time.sleep(0.05)
 
-    assert op_body["status"] == "succeeded"
+    assert op_body["status"] == "succeeded", (
+        f"image operation {op_uuid} still '{op_body.get('status')}' after 20s of polling "
+        f"(expected 'succeeded'); last body: {op_body}"
+    )
     assert len(op_body["data"][0]["b64_json"]) > 10
     assert int(read_mock_state(h.state_file).get("generate_image_calls") or 0) == 1
 
@@ -97,7 +100,9 @@ def test_recover_media_action_for_billed_failed_download(harness_factory):
     assert r.status_code == 202
     task_id = r.json()["task_id"]
 
-    deadline = time.monotonic() + 3.0
+    # Each MCP call spawns a mock process (~1s+ on a slow host), so give the upstream
+    # enough time to surface the poll error instead of a hard 3s cut-off.
+    deadline = time.monotonic() + 20.0
     polled = {}
     while time.monotonic() < deadline:
         polled = c.get(f"/v1/videos/{task_id}", headers=h.auth_headers()).json()
@@ -105,7 +110,10 @@ def test_recover_media_action_for_billed_failed_download(harness_factory):
             break
         time.sleep(0.05)
 
-    assert polled["status"] == "reconcile_needed"
+    assert polled["status"] == "reconcile_needed", (
+        f"video {task_id} still '{polled.get('status')}' after 20s of polling "
+        f"(expected 'reconcile_needed'); last body: {polled}"
+    )
     assert polled["error"]["recoverable_media_id"] == "billed-media-777"
 
     # Invoke recover_media action
