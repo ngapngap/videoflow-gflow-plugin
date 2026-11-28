@@ -41,6 +41,7 @@ from mcp_client import GflowMcpClient, McpTransportError, UpstreamCompatibilityE
 from storage import (
     Clock,
     JobStore,
+    SubmitStage,
     SystemClock,
     validate_confined_path,
     validate_mp4_file,
@@ -346,10 +347,12 @@ async def _run_video_operation(rt: PluginRuntime, operation_id: str, temp_image_
             rt.store.set_meta("default_project_id", str(res["project_id"]))
 
         if res.get("_mcp_is_error") or res.get("status") in ("failed", "error", "rate_limited") or res.get("type"):
+            # Upstream only asserts charged=no when the command failed before any submit side effect
+            stage: SubmitStage = "pre_submit" if res.get("charged") == "no" else "post_submit"
             http_st, err, reconcile = translate_upstream_error(
                 res,
                 media_kind="video",
-                stage="pre_submit" if res.get("charged") == "no" else "post_submit",
+                stage=stage,
                 secrets=rt.secrets,
                 prompts=rt.prompts_seen,
             )
@@ -363,6 +366,7 @@ async def _run_video_operation(rt: PluginRuntime, operation_id: str, temp_image_
                 reconcile=reconcile,
                 charged=str(res.get("charged") or "no"),
                 recoverable_media_id=err.recoverable_media_id,
+                submit_stage=stage,
             )
             return
 
@@ -548,10 +552,12 @@ async def _run_image_operation(rt: PluginRuntime, operation_id: str, temp_image_
             rt.store.set_meta("default_project_id", str(res["project_id"]))
 
         if res.get("_mcp_is_error") or res.get("status") in ("failed", "error", "rate_limited") or res.get("type"):
+            # Upstream only asserts charged=no when the command failed before any submit side effect
+            stage: SubmitStage = "pre_submit" if res.get("charged") == "no" else "post_submit"
             http_st, err, reconcile = translate_upstream_error(
                 res,
                 media_kind="image",
-                stage="pre_submit" if res.get("charged") == "no" else "post_submit",
+                stage=stage,
                 secrets=rt.secrets,
                 prompts=rt.prompts_seen,
             )
@@ -562,6 +568,7 @@ async def _run_image_operation(rt: PluginRuntime, operation_id: str, temp_image_
                 reconcile=reconcile,
                 charged=str(res.get("charged") or "no"),
                 recoverable_media_id=err.recoverable_media_id,
+                submit_stage=stage,
             )
             return
 
@@ -866,9 +873,11 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
         validated = parse_and_validate_video_request(raw_body, rt.catalog, rt.config_snapshot)
         rt.register_prompt(validated.prompt)
 
-        # Check existing operation first to support safe replay/409/409-cancelled
+        # Check existing operation first to support safe replay/409/409-cancelled. A retryable
+        # pre-submit failure is about to be flipped back to reserved by reserve_operation(), so the
+        # readiness gate must run BEFORE that flip: rejecting here must leave the row terminal.
         existing = rt.store.get_by_uuid(op_uuid)
-        if existing is None:
+        if existing is None or JobStore.is_retryable_pre_submit_failure(existing):
             _require_ready_for_new_job(rt, "video")
 
         snapshot = dict(validated.snapshot)
@@ -883,8 +892,6 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
         op = res.operation
 
         if res.outcome in ("created", "retry_allowed"):
-            if res.outcome == "retry_allowed":
-                _require_ready_for_new_job(rt, "video")
             temp_path = rt.store.write_temp_image(op_uuid, validated.image_bytes, validated.image_ext)
             rt.track_task(_run_video_operation(rt, op_uuid, temp_path))
             return JSONResponse(
@@ -1043,8 +1050,10 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
         )
         rt.register_prompt(validated.prompt)
 
+        # Readiness must precede reserve_operation(): for a retryable pre-submit failure that call
+        # flips the row back to reserved, and a rejected request must leave it terminal.
         existing = rt.store.get_by_uuid(op_uuid)
-        if existing is None:
+        if existing is None or JobStore.is_retryable_pre_submit_failure(existing):
             _require_ready_for_new_job(rt, "image")
 
         snapshot = dict(validated.snapshot)
@@ -1065,8 +1074,6 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
             return JSONResponse(status_code=202, content=_operation_to_record(op))
 
         if res.outcome in ("created", "retry_allowed"):
-            if res.outcome == "retry_allowed":
-                _require_ready_for_new_job(rt, "image")
             temp_path = rt.store.write_temp_image(op_uuid, validated.image_bytes, validated.image_ext)
             task = rt.track_task(_run_image_operation(rt, op_uuid, temp_path))
             try:

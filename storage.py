@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from gflow_errors import PluginError, PluginHttpError
 
@@ -18,6 +18,22 @@ DEFAULT_ABANDONED_TIMEOUT_S = 1800
 DEFAULT_MEDIA_BUDGET_BYTES = 10 * 1024 * 1024 * 1024  # 10 GiB
 MIN_MEDIA_RETENTION_S = 7 * 86400
 MAX_MEDIA_UNACCESSED_S = 30 * 86400
+
+# Stage at which a failed operation was rejected by upstream. ``pre_submit`` means upstream
+# asserted the command failed before any submit side effect, so nothing reached the provider.
+SubmitStage = Literal["pre_submit", "post_submit"]
+# Internal marker persisted inside error_json by mark_failed(submit_stage=...). It never leaves
+# the ledger: _row_to_dict lifts it to the row-level ``submit_stage`` and strips it from ``error``.
+_SUBMIT_STAGE_KEY = "_submit_stage"
+
+
+def _parse_error_json(raw: str | None) -> tuple[dict[str, Any] | None, SubmitStage | None]:
+    """Decode error_json into (client-facing error, submit stage marker)."""
+    if not raw:
+        return None, None
+    err = json.loads(raw)
+    stage = err.pop(_SUBMIT_STAGE_KEY, None)
+    return err, stage  # type: ignore[return-value]
 
 
 class Clock(Protocol):
@@ -184,7 +200,7 @@ class JobStore:
             return None
         d = dict(row)
         d["snapshot"] = json.loads(d["snapshot_json"]) if d.get("snapshot_json") else {}
-        d["error"] = json.loads(d["error_json"]) if d.get("error_json") else None
+        d["error"], d["submit_stage"] = _parse_error_json(d.get("error_json"))
         return d
 
     # --- Instance metadata (profile binding & default project) ---
@@ -318,18 +334,12 @@ class JobStore:
             if status == "succeeded":
                 return ReserveResult("replay_succeeded", existing)
 
-            # Retryable pre-submit failure can only be retried by an active POST
-            err = existing.get("error") or {}
-            if (
-                status == "failed"
-                and err.get("retryable") is True
-                and existing.get("charged") == "no"
-                and existing.get("submitted_at") is None
-            ):
+            # Retryable pre-submit failure can only be retried by an active POST.
+            if status == "failed" and self.is_retryable_pre_submit_failure(existing):
                 conn.execute(
                     """
                     UPDATE operations
-                    SET status = 'reserved', error_json = NULL, updated_at = ?
+                    SET status = 'reserved', error_json = NULL, submitted_at = NULL, updated_at = ?
                     WHERE operation_id = ?
                     """,
                     (now, operation_id),
@@ -340,6 +350,20 @@ class JobStore:
             return ReserveResult("replay_terminal", existing)
 
         return self._tx(_op)
+
+    @staticmethod
+    def is_retryable_pre_submit_failure(op: dict[str, Any] | None) -> bool:
+        """True when an active POST may move a failed operation back to reserved.
+
+        Needs a retryable, uncharged failure AND proof that nothing reached the provider. The submit
+        gate stamps submitted_at before the upstream call, so a claimed gate is NOT such proof: only
+        an unclaimed gate or an explicit pre_submit failure is. reconcile_needed never qualifies.
+        """
+        if not op or op.get("status") != "failed":
+            return False
+        err = op.get("error") or {}
+        nothing_submitted = op.get("submitted_at") is None or op.get("submit_stage") == "pre_submit"
+        return err.get("retryable") is True and op.get("charged") == "no" and nothing_submitted
 
     def claim_submit_gate(self, operation_id: str) -> bool:
         """Atomically transition reserved -> submitting if cancel has not won."""
@@ -536,11 +560,20 @@ class JobStore:
         reconcile: bool = False,
         charged: str = "no",
         recoverable_media_id: str | None = None,
+        submit_stage: SubmitStage | None = None,
     ) -> dict[str, Any]:
+        """Record a terminal failure. ``submit_stage`` marks where upstream rejected the command.
+
+        ``pre_submit`` is what later lets reserve_operation() allow an active-POST retry for a
+        retryable, uncharged failure; without it a claimed submit gate stays terminal.
+        """
         now = self.clock.now()
         status = "reconcile_needed" if reconcile else "failed"
         if recoverable_media_id and not error.recoverable_media_id:
             error.recoverable_media_id = recoverable_media_id
+        error_payload = error.to_dict()
+        if submit_stage is not None:
+            error_payload[_SUBMIT_STAGE_KEY] = submit_stage
 
         def _op(conn: sqlite3.Connection) -> dict[str, Any]:
             row = conn.execute("SELECT cancel_requested, status FROM operations WHERE operation_id = ?", (operation_id,)).fetchone()
@@ -559,7 +592,7 @@ class JobStore:
                     updated_at = ?
                 WHERE operation_id = ?
                 """,
-                (status, json.dumps(error.to_dict()), charged, recoverable_media_id, now, operation_id),
+                (status, json.dumps(error_payload), charged, recoverable_media_id, now, operation_id),
             )
             updated = conn.execute("SELECT * FROM operations WHERE operation_id = ?", (operation_id,)).fetchone()
             return self._row_to_dict(updated)  # type: ignore[return-value]
