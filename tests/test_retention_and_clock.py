@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 
-from tests.conftest import FakeClock
+from tests.conftest import VALID_PNG_DATA_URL, FakeClock, read_mock_state, write_mock_state
 from tests.mock_mcp_server import make_valid_mp4_bytes
 
 
@@ -30,6 +31,186 @@ def test_abandoned_job_timeout_1800s_persists_across_polls_and_restart(harness_f
     assert r2.status_code == 200
     assert r2.json()["status"] == "reconcile_needed"
     assert r2.json()["error"]["code"] == "OPERATION_TIMED_OUT"
+
+
+def test_abandoned_after_delete_times_out_to_reconcile_needed(harness_factory):
+    """DELETE while upstream never reports cancelled/completed must not poll forever (issue #14).
+
+    SPEC 247: once the 1800s mark passes without a known outcome the row becomes
+    ``reconcile_needed`` (never ``cancelled``: upstream may still be running and billing), keeping
+    the UUID, media ID and cancel tombstone so the host can reconcile.
+    """
+    clock = FakeClock(initial=1_700_000_000.0)
+    h = harness_factory(clock=clock, mock_state={"polls_before_done": 1_000_000})
+    op_uuid = str(uuid.uuid4())
+
+    r_post = h.client.post(
+        "/v1/videos",
+        headers=h.auth_headers(op_uuid),
+        json={"prompt": "cat", "size": "1280x720", "seconds": 8, "image": VALID_PNG_DATA_URL},
+    )
+    assert r_post.status_code == 202
+
+    # Wait until upstream_task_id is recorded
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        op = h.runtime.store.get_by_uuid(op_uuid)
+        if op and op.get("upstream_task_id"):
+            break
+        time.sleep(0.02)
+    assert op is not None and op.get("upstream_task_id")
+
+    r_del = h.client.delete(f"/v1/videos/{r_post.json()['task_id']}", headers=h.auth_headers())
+    assert r_del.status_code == 200
+    assert r_del.json()["status"] == "abandoned"
+
+    # Stage the SPEC 247 situation: a media ID is already known (possibly billed) but the outcome is not
+    billed_media_id = "media-billed123"
+    def _set_media(conn):
+        conn.execute("UPDATE operations SET upstream_media_id = ? WHERE operation_id = ?", (billed_media_id, op_uuid))
+    h.runtime.store._tx(_set_media)
+
+    # At 1799s (one second below the >= 1800s threshold) the abandoned job is left alone
+    clock.advance(1799)
+    r_before = h.client.get(f"/vf-plugin/v1/operations/{op_uuid}", headers=h.auth_headers())
+    assert r_before.json()["status"] == "abandoned"
+
+    # Crossing the threshold moves it to reconcile_needed; poll loop exits on that terminal status
+    clock.advance(2)
+    r_after = h.client.get(f"/vf-plugin/v1/operations/{op_uuid}", headers=h.auth_headers())
+    assert r_after.status_code == 200
+    assert r_after.json()["status"] == "reconcile_needed"
+    assert r_after.json()["error"]["code"] == "OPERATION_TIMED_OUT"
+    assert int(read_mock_state(h.state_file).get("generate_video_calls") or 0) == 1
+
+    # Reconciliation trail survives: UUID, upstream task/media IDs and the cancel tombstone are kept,
+    # and the error carries the media ID so the host can reconcile a possibly-billed asset.
+    row = h.runtime.store.get_by_uuid(op_uuid)
+    assert row["cancel_requested"] == 1
+    assert row["upstream_task_id"] == op["upstream_task_id"]
+    assert row["upstream_media_id"] == billed_media_id
+    assert r_after.json()["error"]["recoverable_media_id"] == billed_media_id
+
+    # A late POST with the same UUID is still rejected (tombstone) and never re-generates
+    r_replay = h.client.post(
+        "/v1/videos",
+        headers=h.auth_headers(op_uuid),
+        json={"prompt": "cat", "size": "1280x720", "seconds": 8, "image": VALID_PNG_DATA_URL},
+    )
+    assert r_replay.status_code == 409
+    assert r_replay.json()["error"]["code"] == "OPERATION_CANCELLED"
+    assert h.runtime.store.get_by_uuid(op_uuid)["status"] == "reconcile_needed"
+    assert int(read_mock_state(h.state_file).get("generate_video_calls") or 0) == 1
+
+
+def test_abandoned_poll_loop_exits_when_upstream_ignores_cancel(harness_factory):
+    """Regression for issue #14: upstream keeps reporting ``working`` and ignores tasks/cancel.
+
+    Before the fix the ``_poll_video_task`` loop kept polling (one new MCP session per call)
+    until process restart because ``abandoned`` was never timed out.
+    """
+    clock = FakeClock(initial=1_700_000_000.0)
+    h = harness_factory(clock=clock, mock_state={"polls_before_done": 1_000_000})
+    op_uuid = str(uuid.uuid4())
+
+    async def _noop_cancel(_task_id: str) -> dict[str, object]:
+        return {}
+
+    # Upstream accepts tasks/cancel but never acts on it (keeps answering "working")
+    h.runtime.mcp.cancel_task = _noop_cancel  # type: ignore[method-assign]
+
+    r_post = h.client.post(
+        "/v1/videos",
+        headers=h.auth_headers(op_uuid),
+        json={"prompt": "cat", "size": "1280x720", "seconds": 8, "image": VALID_PNG_DATA_URL},
+    )
+    assert r_post.status_code == 202
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        op = h.runtime.store.get_by_uuid(op_uuid)
+        if op and op.get("upstream_task_id"):
+            break
+        time.sleep(0.02)
+    assert op is not None and op.get("upstream_task_id")
+
+    r_del = h.client.delete(f"/vf-plugin/v1/operations/{op_uuid}", headers=h.auth_headers())
+    assert r_del.status_code == 200
+    assert r_del.json()["status"] == "abandoned"
+    lpa_at_abandon = h.runtime.store.get_by_uuid(op_uuid)["last_progress_at"]
+
+    # The background poll task is still alive while it is inside the timeout window
+    live = [t for t in h.runtime.background_tasks if not t.done()]
+    assert len(live) == 1
+    poll_task = live[0]
+
+    clock.advance(1801)
+
+    # The loop calls check_abandoned_timeouts() every iteration and must now return
+    exited = False
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if poll_task.done():
+            exited = True
+            break
+        time.sleep(0.02)
+    assert exited, "poll loop did not exit after abandoned timeout"
+    final = h.runtime.store.get_by_uuid(op_uuid)
+    assert final["status"] == "reconcile_needed"
+    assert final["error"]["code"] == "OPERATION_TIMED_OUT"
+    # Root cause #2: upstream "working" on an abandoned job is NOT progress, so the timeout
+    # reference must never be refreshed — otherwise the window is pushed out forever.
+    assert final["last_progress_at"] == lpa_at_abandon
+
+
+def test_abandoned_job_that_completes_upstream_still_succeeds(harness_factory):
+    """Guard: upstream reporting completed AFTER the user abandoned must still yield the media.
+
+    The abandoned timeout only fires when no outcome is known; a real completion inside the window
+    keeps the pre-existing mark_succeeded_video behaviour (SPEC: GET may return succeeded later).
+    """
+    clock = FakeClock(initial=1_700_000_000.0)
+    h = harness_factory(clock=clock, mock_state={"polls_before_done": 1_000_000})
+    op_uuid = str(uuid.uuid4())
+
+    async def _noop_cancel(_task_id: str) -> dict[str, object]:
+        return {}
+
+    # tasks/cancel is accepted but ignored, so the upstream job keeps running and later completes
+    h.runtime.mcp.cancel_task = _noop_cancel  # type: ignore[method-assign]
+
+    r_post = h.client.post(
+        "/v1/videos",
+        headers=h.auth_headers(op_uuid),
+        json={"prompt": "cat", "size": "1280x720", "seconds": 8, "image": VALID_PNG_DATA_URL},
+    )
+    assert r_post.status_code == 202
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        op = h.runtime.store.get_by_uuid(op_uuid)
+        if op and op.get("upstream_task_id"):
+            break
+        time.sleep(0.02)
+    assert op is not None and op.get("upstream_task_id")
+
+    r_del = h.client.delete(f"/vf-plugin/v1/operations/{op_uuid}", headers=h.auth_headers())
+    assert r_del.status_code == 200
+    assert r_del.json()["status"] == "abandoned"
+
+    # Upstream finishes while we are still well inside the 1800s window
+    clock.advance(60)
+    write_mock_state(h.state_file, {**read_mock_state(h.state_file), "polls_before_done": 1})
+
+    status = ""
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        status = h.client.get(f"/vf-plugin/v1/operations/{op_uuid}", headers=h.auth_headers()).json()["status"]
+        if status == "succeeded":
+            break
+        time.sleep(0.05)
+    assert status == "succeeded"
+    assert int(read_mock_state(h.state_file).get("generate_video_calls") or 0) == 1
 
 
 def test_media_retention_7d_30d_budget_and_410_gone(harness_factory):

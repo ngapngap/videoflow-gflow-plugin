@@ -407,7 +407,15 @@ async def _poll_video_task(rt: PluginRuntime, operation_id: str, upstream_task_i
             continue
 
         task_status = str(task_res.get("status") or "").lower()
-        if task_status != last_seen_status and task_status in ("working", "running", "processing"):
+        # Re-read after the (slow) probe: DELETE may have abandoned the job while get_task was in flight.
+        # A user-cancelled job that upstream still reports as "working" is NOT progress, so never refresh
+        # last_progress_at for it — otherwise the abandoned_timeout_s window is pushed out forever (issue #14).
+        # Terminal upstream answers (cancelled/completed/failed) below still run so the outcome is recorded.
+        cancel_requested = op["status"] == "abandoned" or op.get("cancel_requested") == 1
+        if not cancel_requested:
+            cur = rt.store.get_by_uuid(operation_id)
+            cancel_requested = cur is not None and (cur["status"] == "abandoned" or cur.get("cancel_requested") == 1)
+        if not cancel_requested and task_status != last_seen_status and task_status in ("working", "running", "processing"):
             last_seen_status = task_status
             rt.store.touch_progress(operation_id)
 

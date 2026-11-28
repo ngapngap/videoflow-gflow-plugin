@@ -605,18 +605,29 @@ class JobStore:
     # --- Timeouts & crash recovery ---
 
     def check_abandoned_timeouts(self) -> list[str]:
-        """Transition processing jobs whose progress timestamp exceeded abandoned_timeout_s."""
+        """Expire stalled jobs and return the operation_ids whose status changed.
+
+        * ``processing`` rows with no upstream progress for ``abandoned_timeout_s`` become
+          ``reconcile_needed`` (outcome unknown, needs manual reconciliation).
+        * ``abandoned`` rows (user cancelled after submit) that upstream never confirmed as
+          cancelled/completed within ``abandoned_timeout_s`` also become ``reconcile_needed``
+          (SPEC 247): upstream may still be running and billing, so we must not assert
+          ``cancelled``; the UUID, media ID and cancel tombstone (``cancel_requested``) are kept
+          for reconciliation. Either way the poll loop stops instead of polling forever.
+        """
         now = self.clock.now()
         timed_out: list[str] = []
 
         def _op(conn: sqlite3.Connection) -> None:
             rows = conn.execute(
-                "SELECT operation_id, last_progress_at, submitted_at, created_at, upstream_media_id "
-                "FROM operations WHERE status = 'processing'"
+                "SELECT operation_id, status, last_progress_at, submitted_at, created_at, upstream_media_id, error_json "
+                "FROM operations WHERE status IN ('processing', 'abandoned')"
             ).fetchall()
             for r in rows:
                 ref_ts = r["last_progress_at"] or r["submitted_at"] or r["created_at"]
-                if now - float(ref_ts) >= self.abandoned_timeout_s:
+                if now - float(ref_ts) < self.abandoned_timeout_s:
+                    continue
+                if r["status"] == "processing":
                     err = PluginError(
                         code="OPERATION_TIMED_OUT",
                         kind="transient",
@@ -629,7 +640,23 @@ class JobStore:
                         "UPDATE operations SET status = 'reconcile_needed', error_json = ?, updated_at = ? WHERE operation_id = ?",
                         (json.dumps(err.to_dict()), now, r["operation_id"]),
                     )
-                    timed_out.append(r["operation_id"])
+                else:
+                    err_json = r["error_json"]
+                    if not err_json:
+                        err = PluginError(
+                            code="OPERATION_TIMED_OUT",
+                            kind="transient",
+                            retryable=False,
+                            message="Đã ghi nhận hủy nhưng upstream không xác nhận trong thời gian chờ; giữ trạng thái để đối soát.",
+                            scope="operation",
+                            recoverable_media_id=r["upstream_media_id"],
+                        )
+                        err_json = json.dumps(err.to_dict())
+                    conn.execute(
+                        "UPDATE operations SET status = 'reconcile_needed', error_json = ?, updated_at = ? WHERE operation_id = ?",
+                        (err_json, now, r["operation_id"]),
+                    )
+                timed_out.append(r["operation_id"])
 
         self._tx(_op)
         return timed_out
