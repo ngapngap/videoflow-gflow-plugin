@@ -139,10 +139,17 @@ def test_abandoned_poll_loop_exits_when_upstream_ignores_cancel(harness_factory)
     assert r_del.json()["status"] == "abandoned"
     lpa_at_abandon = h.runtime.store.get_by_uuid(op_uuid)["last_progress_at"]
 
-    # The background poll task is still alive while it is inside the timeout window
-    live = [t for t in h.runtime.background_tasks if not t.done()]
-    assert len(live) == 1
-    poll_task = live[0]
+    # The background task that runs the poll loop is still alive while it is inside the timeout
+    # window. _run_video_operation() awaits _poll_video_task() directly, so that outer task IS the
+    # poll loop. Other long-lived tasks (e.g. the daily media cleanup loop) are tracked too, so
+    # identify it by its coroutine rather than by counting live tasks.
+    poll_tasks = [
+        t
+        for t in h.runtime.background_tasks
+        if not t.done() and t.get_coro().__qualname__ == "_run_video_operation"
+    ]
+    assert len(poll_tasks) == 1
+    poll_task = poll_tasks[0]
 
     clock.advance(1801)
 
