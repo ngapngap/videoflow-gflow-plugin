@@ -8,6 +8,7 @@ import uuid
 
 from gflow_errors import PluginError
 from tests.conftest import OTHER_PNG_DATA_URL, VALID_PNG_DATA_URL, read_mock_state, write_mock_state
+from storage import JobStore
 
 
 def test_delete_before_post_and_after_restart_yields_0_generates(harness_factory):
@@ -150,6 +151,97 @@ def test_crash_before_and_after_upstream_id_recovery(harness_factory):
             break
         time.sleep(0.05)
     assert status == "succeeded"
+
+
+def _hold_generation_lock_from_test_thread(rt) -> None:
+    """Take rt.generation_lock from the (loop-less) test thread.
+
+    An uncontended asyncio.Lock.acquire() completes synchronously without touching the loop, so
+    driving the coroutine by hand is enough; the app's event loop later sees the lock as taken.
+    """
+    try:
+        rt.generation_lock.acquire().send(None)
+    except StopIteration as acquired:
+        assert acquired.value is True
+    assert rt.generation_lock.locked()
+
+
+def _reserve_orphan_waiting_for_generation_lock(h) -> tuple[str, str]:
+    """Drive a POST into the 'reserved' state (job queued behind generation_lock), then 'crash'.
+
+    Holding rt.generation_lock keeps the spawned _run_video_operation from claiming the submit
+    gate, so the row stays 'reserved' with no upstream_task_id. h.stop() then emulates the
+    process dying before the job ever gets its turn.
+    """
+    op_uuid = str(uuid.uuid4())
+    _hold_generation_lock_from_test_thread(h.runtime)
+
+    r_post = h.client.post(
+        "/v1/videos",
+        headers=h.auth_headers(op_uuid),
+        json={"prompt": "cat", "size": "1280x720", "seconds": 8, "image": VALID_PNG_DATA_URL},
+    )
+    assert r_post.status_code == 202
+    task_id = r_post.json()["task_id"]
+
+    # Give the queued worker a chance to run: it must block on generation_lock, not submit.
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+    op = h.runtime.store.get_by_uuid(op_uuid)
+    assert op is not None and op["status"] == "reserved"
+    assert op["upstream_task_id"] is None
+    assert op["submitted_at"] is None
+    h.stop()
+    return op_uuid, task_id
+
+
+def test_restart_marks_reserved_orphan_failed_and_allows_retry(harness_factory):
+    """Regression (#13): a 'reserved' row left behind by a crash must not stay 'processing' forever."""
+    h = harness_factory(subdir="reserved_orphan", mock_state={"polls_before_done": 1})
+    op_uuid, task_id = _reserve_orphan_waiting_for_generation_lock(h)
+
+    # Store-level: reopen the ledger the crashed process left behind. Startup recovery must not
+    # report anything to resume and must turn the row into a retryable, uncharged failure.
+    store = JobStore(h.data_dir / "jobs.db", h.runtime.output_dir, h.runtime.tmp_dir, clock=h.clock)
+    try:
+        assert store.recover_on_startup() == []
+        op = store.get_by_uuid(op_uuid)
+        assert op["status"] == "failed"
+        assert op["error"]["code"] == "INTERRUPTED_BEFORE_SUBMIT"
+        assert op["error"]["kind"] == "transient"
+        assert op["error"]["retryable"] is True
+        assert op["error"]["scope"] == "operation"
+        assert op["charged"] == "no"
+        assert op["submitted_at"] is None
+    finally:
+        store.close()
+
+    # HTTP-level: GET no longer says 'processing'; re-POST with the same key is accepted (202)
+    # via the retry_allowed branch and the job finally runs exactly once.
+    c2 = h.restart()
+    r_get = c2.get(f"/v1/videos/{task_id}", headers=h.auth_headers())
+    assert r_get.status_code == 200
+    assert r_get.json()["status"] == "failed"
+    assert r_get.json()["error"]["code"] == "INTERRUPTED_BEFORE_SUBMIT"
+
+    r_retry = c2.post(
+        "/v1/videos",
+        headers=h.auth_headers(op_uuid),
+        json={"prompt": "cat", "size": "1280x720", "seconds": 8, "image": VALID_PNG_DATA_URL},
+    )
+    assert r_retry.status_code == 202
+    assert r_retry.json()["task_id"] == task_id
+
+    deadline = time.monotonic() + 5.0
+    status = ""
+    while time.monotonic() < deadline:
+        status = c2.get(f"/v1/videos/{task_id}", headers=h.auth_headers()).json()["status"]
+        if status in ("succeeded", "failed", "reconcile_needed"):
+            break
+        time.sleep(0.05)
+    assert status == "succeeded"
+    assert int(read_mock_state(h.state_file).get("generate_video_calls") or 0) == 1
 
 
 def test_config_change_preserves_original_operation_snapshot(harness_factory):

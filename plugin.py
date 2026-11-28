@@ -615,6 +615,8 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
         rt.storage_pressure = bool(cleanup_res.get("storage_pressure"))
         resumed = rt.store.recover_on_startup()
         await _refresh_catalog(rt)
+        # recover_on_startup() only returns jobs that already hold an upstream_task_id; reserved
+        # rows that never reached the submit gate are failed as INTERRUPTED_BEFORE_SUBMIT there.
         for op in resumed:
             if op.get("media_kind") == "video" and op.get("upstream_task_id"):
                 rt.track_task(_poll_video_task(rt, op["operation_id"], op["upstream_task_id"]))

@@ -635,9 +635,19 @@ class JobStore:
         return timed_out
 
     def recover_on_startup(self) -> list[dict[str, Any]]:
-        """Reconcile interrupted rows after process restart and return jobs to resume polling."""
+        """Reconcile interrupted rows after process restart and return jobs to resume polling.
+
+        - ``reserved`` (never claimed the submit gate): nothing was sent upstream, so mark it
+          ``failed`` with a retryable, uncharged ``INTERRUPTED_BEFORE_SUBMIT`` error. The same
+          Idempotency-Key can then be re-POSTed and goes through the ``retry_allowed`` branch.
+        - ``submitting`` without ``upstream_task_id``: ``reconcile_needed`` (may have been charged).
+        - ``submitting``/``processing`` with ``upstream_task_id``: ``reconcile_needed`` when the
+          abandoned timeout already elapsed, otherwise returned so polling resumes.
+        - ``cancel_requested`` rows are honoured first regardless of status.
+        """
         now = self.clock.now()
         to_resume: list[dict[str, Any]] = []
+        interrupted: list[str] = []
 
         def _op(conn: sqlite3.Connection) -> None:
             rows = conn.execute(
@@ -714,9 +724,26 @@ class JobStore:
                     continue
 
                 if status == "reserved":
-                    to_resume.append(op)
+                    # Row never claimed the submit gate, so upstream has not seen anything and
+                    # nothing was charged. Fail it (retryable, submitted_at NULL) so a re-POST with
+                    # the same Idempotency-Key hits the ``retry_allowed`` branch instead of
+                    # replaying 202 forever.
+                    err = PluginError(
+                        code="INTERRUPTED_BEFORE_SUBMIT",
+                        kind="transient",
+                        retryable=True,
+                        message="Plugin dừng trước khi gửi yêu cầu lên upstream; gửi lại với cùng Idempotency-Key.",
+                        scope="operation",
+                    )
+                    conn.execute(
+                        "UPDATE operations SET status = 'failed', error_json = ?, charged = 'no', submitted_at = NULL, updated_at = ? WHERE operation_id = ?",
+                        (json.dumps(err.to_dict()), now, op_id),
+                    )
+                    interrupted.append(op_id)
 
         self._tx(_op)
+        for op_id in interrupted:
+            self.cleanup_temp_image(op_id)
         return to_resume
 
     def count_active_jobs(self) -> int:
