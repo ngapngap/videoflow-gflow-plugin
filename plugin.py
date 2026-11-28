@@ -486,6 +486,7 @@ async def _poll_video_task(rt: PluginRuntime, operation_id: str, upstream_task_i
                 )
                 return
 
+            rt.browser_lost = False  # a completed video proves the browser session is alive again
             rt.store.mark_succeeded_video(
                 operation_id,
                 media_path=confined,
@@ -710,6 +711,36 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
         rt = runtime
         active_jobs = rt.store.count_active_jobs()
         stale_lock, lock_msg = detect_stale_browser_lock(rt.gflow_home, rt.profile, active_jobs)
+
+        # Always probe auth_status (unless the probe itself fails) so a previous
+        # auth_degraded / browser_lost flag never stays sticky: the flag is re-derived
+        # from the live upstream answer on every call and cleared once the user
+        # re-authenticates.
+        auth_probe_failed = False
+        try:
+            auth_res = await rt.mcp.auth_status(rt.profile)
+            st = str(auth_res.get("status") or "authenticated")
+            if st in ("authenticated", "unknown"):
+                rt.auth_degraded = False
+                rt.auth_message = ""
+                rt.browser_lost = False
+                if rt.instance_block and rt.instance_block.error.kind == "auth":
+                    rt.instance_block = None
+                if auth_res.get("user_email"):
+                    email = str(auth_res["user_email"])
+                    bound_email = rt.store.get_meta("bound_account_email")
+                    if bound_email and bound_email != email:
+                        rt.identity_degraded = True
+                        rt.identity_message = "Tài khoản đăng nhập không khớp với lịch sử instance."
+                    elif not bound_email:
+                        rt.store.set_meta("bound_account_email", email)
+            else:
+                rt.auth_degraded = True
+                rt.auth_message = "Cần đăng nhập lại"
+        except Exception:
+            # Probe broken: keep the last known auth verdict instead of inventing one.
+            auth_probe_failed = True
+
         browser_lost = rt.browser_lost or stale_lock
 
         checks: dict[str, dict[str, str]] = {
@@ -725,28 +756,10 @@ def create_app(runtime: PluginRuntime) -> FastAPI:
             checks["upstream"] = {"status": "degraded", "message": rt.compatibility_error}
         if rt.auth_degraded:
             checks["account"] = {"status": "degraded", "message": rt.auth_message or "Cần đăng nhập lại"}
+        elif auth_probe_failed:
+            checks["account"] = {"status": "ok", "message": "Chưa kiểm tra upstream"}
         else:
-            # Probe auth_status lightly if available to allow recovery from auth/instance block
-            try:
-                auth_res = await rt.mcp.auth_status(rt.profile)
-                st = str(auth_res.get("status") or "authenticated")
-                if st in ("authenticated", "unknown"):
-                    checks["account"] = {"status": "ok", "message": "Đã xác thực"}
-                    if rt.instance_block and rt.instance_block.error.kind == "auth":
-                        rt.instance_block = None
-                    if auth_res.get("user_email"):
-                        email = str(auth_res["user_email"])
-                        bound_email = rt.store.get_meta("bound_account_email")
-                        if bound_email and bound_email != email:
-                            rt.identity_degraded = True
-                            rt.identity_message = "Tài khoản đăng nhập không khớp với lịch sử instance."
-                            checks["identity"] = {"status": "degraded", "message": rt.identity_message}
-                        elif not bound_email:
-                            rt.store.set_meta("bound_account_email", email)
-                else:
-                    checks["account"] = {"status": "degraded", "message": "Cần đăng nhập lại"}
-            except Exception:
-                checks["account"] = {"status": "ok", "message": "Chưa kiểm tra upstream"}
+            checks["account"] = {"status": "ok", "message": "Đã xác thực"}
 
         degraded = any(c["status"] != "ok" for c in checks.values()) or (
             rt.instance_block is not None and rt.instance_block.expires_at is None

@@ -178,9 +178,12 @@ def test_upstream_424_auth_429_quota_vs_transient_and_redaction(harness_factory)
     )
     assert r_blocked.status_code == 424
 
-    # Healthz recovers auth block when upstream reports authenticated
+    # Healthz probes auth_status (mock default = authenticated) and clears the auth block + flag
     hz = c.get("/healthz", headers=h.auth_headers())
-    assert hz.status_code == 503  # auth_degraded flag from previous failure
+    assert hz.status_code == 200
+    assert hz.json()["checks"]["account"]["status"] == "ok"
+    assert h.runtime.auth_degraded is False
+    assert h.runtime.instance_block is None
 
     # Test 429 quota vs 429 transient via gflow_errors directly
     from gflow_errors import translate_upstream_error
@@ -198,6 +201,138 @@ def test_upstream_424_auth_429_quota_vs_transient_and_redaction(harness_factory)
         stage="pre_submit",
     )
     assert st_t == 429 and err_t.kind == "transient" and err_t.retryable is True
+
+
+AUTH_EXPIRED_ERROR = {
+    "type": "https://gflow-cli.dev/errors/auth-expired",
+    "charged": "no",
+    "retryable": False,
+    "next_action": "reauth",
+}
+
+
+def _post_video(h, op_id: str | None = None):
+    return h.client.post(
+        "/v1/videos",
+        headers=h.auth_headers(op_id or str(uuid.uuid4())),
+        json={"prompt": "cat", "size": "1280x720", "seconds": 8, "image": VALID_PNG_DATA_URL},
+    )
+
+
+def test_auth_degraded_recovers_via_healthz_probe(harness_factory):
+    """Regression: auth_degraded / auth instance_block must clear once upstream is authenticated again."""
+    h = harness_factory(mock_state={"generate_video_error": AUTH_EXPIRED_ERROR, "auth_response": {"status": "expired"}})
+    c = h.client
+
+    # 1. auth-expired failure -> operation failed, instance blocked
+    r1 = _post_video(h)
+    assert r1.status_code == 202
+    polled = _poll_until_terminal(c, h.auth_headers(), r1.json()["task_id"])
+    assert polled["status"] == "failed"
+    assert polled["error"]["code"] == "UPSTREAM_AUTH_REQUIRED"
+    assert h.runtime.auth_degraded is True
+    assert h.runtime.instance_block is not None
+    assert h.runtime.instance_block.expires_at is None
+
+    # 2. Still expired -> POST blocked with 424, healthz probes and reports degraded
+    assert _post_video(h).status_code == 424
+    hz_blocked = c.get("/healthz", headers=h.auth_headers())
+    assert hz_blocked.status_code == 503
+    assert hz_blocked.json()["checks"]["account"]["status"] == "degraded"
+
+    # 3. User re-authenticates: healthz must keep probing even though auth_degraded is already set
+    state = read_mock_state(h.state_file)
+    state["generate_video_error"] = None
+    state["auth_response"] = {"status": "authenticated", "profile": "p1", "user_email": "test@example.com"}
+    write_mock_state(h.state_file, state)
+    hz_ok = c.get("/healthz", headers=h.auth_headers())
+    assert hz_ok.status_code == 200
+    assert hz_ok.json()["status"] == "ok"
+    assert hz_ok.json()["checks"]["account"] == {"status": "ok", "message": "Đã xác thực"}
+    assert h.runtime.auth_degraded is False
+    assert h.runtime.instance_block is None
+
+    # 4. New job is accepted again
+    r_new = _post_video(h)
+    assert r_new.status_code == 202
+    assert _poll_until_terminal(c, h.auth_headers(), r_new.json()["task_id"])["status"] == "succeeded"
+
+
+def test_browser_lost_flag_resets_on_healthz_probe_and_on_success(harness_factory):
+    """Regression: browser_lost set by BROWSER_SESSION_CLOSED must not stay sticky."""
+    browser_closed = {
+        "type": "https://gflow-cli.dev/errors/browser-session-closed",
+        "charged": "no",
+        "retryable": False,
+    }
+    # Upstream still reports an expired session, so only the signals under test can clear the flag.
+    h = harness_factory(mock_state={"task_poll_error": browser_closed, "auth_response": {"status": "expired"}})
+    c = h.client
+
+    # 1. Browser lost during poll (post_submit -> reconcile_needed) -> flag set, healthz browser degraded
+    r1 = _post_video(h)
+    assert r1.status_code == 202
+    polled = _poll_until_terminal(c, h.auth_headers(), r1.json()["task_id"])
+    assert polled["status"] == "reconcile_needed"
+    assert polled["error"]["code"] == "BROWSER_SESSION_CLOSED"
+    assert h.runtime.browser_lost is True
+    assert h.runtime.instance_block is None  # operation-scope error never blocks the instance
+    hz1 = c.get("/healthz", headers=h.auth_headers())
+    assert hz1.status_code == 503
+    assert hz1.json()["checks"]["browser"]["status"] == "degraded"
+    assert h.runtime.browser_lost is True  # probe did not clear it: upstream is not healthy yet
+
+    # 2. A successful video clears the flag on its own (no healthz probe in between)
+    write_mock_state(h.state_file, {"polls_before_done": 1, "auth_response": {"status": "expired"}})
+    r2 = _post_video(h)
+    assert r2.status_code == 202
+    assert _poll_until_terminal(c, h.auth_headers(), r2.json()["task_id"])["status"] == "succeeded"
+    assert h.runtime.browser_lost is False
+    hz2 = c.get("/healthz", headers=h.auth_headers())
+    assert hz2.json()["checks"]["browser"]["status"] == "ok"
+
+    # 3. Probe path alone also clears the flag once upstream is healthy again
+    h.runtime.browser_lost = True
+    write_mock_state(h.state_file, {"auth_response": {"status": "authenticated", "profile": "p1", "user_email": "test@example.com"}})
+    hz3 = c.get("/healthz", headers=h.auth_headers())
+    assert hz3.status_code == 200
+    assert hz3.json()["checks"]["browser"]["status"] == "ok"
+    assert h.runtime.browser_lost is False
+
+
+def test_healthz_probe_failure_keeps_last_known_auth_verdict(harness_factory, monkeypatch):
+    """When auth_status cannot be reached, healthz must not invent a verdict nor clear the auth block."""
+    from mcp_client import McpTransportError
+
+    h = harness_factory(mock_state={"generate_video_error": AUTH_EXPIRED_ERROR})
+    c = h.client
+
+    r1 = _post_video(h)
+    assert r1.status_code == 202
+    assert _poll_until_terminal(c, h.auth_headers(), r1.json()["task_id"])["status"] == "failed"
+    assert h.runtime.auth_degraded is True
+
+    async def _broken_auth_status(profile):
+        raise McpTransportError("MCP server unreachable")
+
+    monkeypatch.setattr(h.runtime.mcp, "auth_status", _broken_auth_status)
+    hz = c.get("/healthz", headers=h.auth_headers())
+    assert hz.status_code == 503
+    assert hz.json()["checks"]["account"]["status"] == "degraded"
+    assert h.runtime.auth_degraded is True
+    assert h.runtime.instance_block is not None
+    assert _post_video(h).status_code == 424
+
+    # Probe healthy again (tool absent upstream -> "unknown") -> block cleared, verdict re-derived
+    async def _unknown_auth_status(profile):
+        return {"status": "unknown"}
+
+    monkeypatch.setattr(h.runtime.mcp, "auth_status", _unknown_auth_status)
+    hz2 = c.get("/healthz", headers=h.auth_headers())
+    assert hz2.status_code == 200
+    assert hz2.json()["checks"]["account"]["status"] == "ok"
+    assert h.runtime.auth_degraded is False
+    assert h.runtime.instance_block is None
 
 
 def test_file_confinement_and_corrupt_mp4_rejected(harness_factory, tmp_path: Path):
